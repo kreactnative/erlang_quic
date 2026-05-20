@@ -478,6 +478,7 @@
     server_cert :: binary() | undefined,
     server_cert_chain = [] :: [binary()],
     server_private_key :: term() | undefined,
+    sni_certs = #{} :: map(),
     %% Server preferred address config (RFC 9000 Section 9.6)
     %% Set from listener options: {IPv4, IPv6} where each is {Addr, Port} | undefined
     server_preferred_address :: #preferred_address{} | undefined,
@@ -1039,6 +1040,7 @@ init({server, Opts}) ->
         server_cert = Cert,
         server_cert_chain = CertChain,
         server_private_key = PrivateKey,
+        sni_certs = maps:get(sni_certs, Opts, #{}),
         server_preferred_address = build_server_preferred_address(Opts),
         cid_config = maps:get(cid_config, Opts, undefined),
         congestion_threshold = maps:get(congestion_threshold, Opts, 2),
@@ -2740,7 +2742,6 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
     HandshakePayload =
         <<EncExtMsg/binary, CertReqMsg/binary, CertMsg/binary, CertVerifyMsg/binary,
             FinishedMsg/binary>>,
-    CryptoFrame = quic_frame:encode({crypto, 0, HandshakePayload}),
 
     %% Determine next TLS state based on verify option
     %% If verify=true, we expect Certificate from client next
@@ -2760,8 +2761,26 @@ send_server_handshake_flight(Cipher, _TranscriptHashAfterSH, State) ->
         key_state = KeyState
     },
 
-    %% Send in Handshake packet
-    send_handshake_packet(CryptoFrame, State1).
+    %% Send in Handshake packet(s), fragmenting large CRYPTO payloads
+    %% to stay under current MTU.
+    send_handshake_crypto_fragmented(HandshakePayload, 0, State1).
+
+%% @doc Fragment a TLS CRYPTO payload into HANDSHAKE-level packets that fit
+%% current path MTU limits.
+send_handshake_crypto_fragmented(<<>>, _Offset, State) ->
+    State;
+send_handshake_crypto_fragmented(Payload, Offset, State) ->
+    %% Conservative fixed overhead per HANDSHAKE packet:
+    %% QUIC long header + CRYPTO frame header + AEAD tag.
+    Overhead = 48,
+    MaxMtu = get_current_mtu(State),
+    ChunkSize = max(256, MaxMtu - Overhead),
+    DataSize = byte_size(Payload),
+    ActualChunk = min(DataSize, ChunkSize),
+    <<Chunk:ActualChunk/binary, Rest/binary>> = Payload,
+    CryptoFrame = quic_frame:encode({crypto, Offset, Chunk}),
+    State1 = send_handshake_packet(CryptoFrame, State),
+    send_handshake_crypto_fragmented(Rest, Offset + ActualChunk, State1).
 
 %% Server: Send HANDSHAKE_DONE frame after receiving client Finished
 send_handshake_done(State) ->
@@ -4570,6 +4589,9 @@ process_tls_message(
                 transport_params := TP,
                 session_id := SessionId
             } = ClientHelloInfo} ->
+            ServerName = maps:get(server_name, ClientHelloInfo, undefined),
+            {ServerCert, ServerCertChain, ServerPrivateKey} =
+                select_server_tls_material(ServerName, State),
             %% Extract x25519 public key from key share entries
             ClientPubKey = extract_x25519_key(KeyShareEntries),
             %% Select cipher suite (prefer server's order)
@@ -4743,6 +4765,10 @@ process_tls_message(
                 tls_state = ?TLS_AWAITING_CLIENT_FINISHED,
                 tls_transcript = Transcript,
                 tls_private_key = ServerPrivKey,
+                server_name = normalize_sni_name(ServerName),
+                server_cert = ServerCert,
+                server_cert_chain = ServerCertChain,
+                server_private_key = ServerPrivateKey,
                 handshake_secret = HandshakeSecret,
                 client_hs_secret = ClientHsSecret,
                 server_hs_secret = ServerHsSecret,
@@ -5263,6 +5289,67 @@ process_tls_message(
     end;
 process_tls_message(_Level, _Type, _Body, _OriginalMsg, State) ->
     State.
+
+select_server_tls_material(ServerName, #state{
+    sni_certs = SniCerts,
+    server_cert = DefaultCert,
+    server_cert_chain = DefaultChain,
+    server_private_key = DefaultKey
+}) ->
+    case sni_cert_entry(ServerName, SniCerts) of
+        #{cert := Cert, private_key := PrivateKey} = Entry ->
+            {Cert, maps:get(cert_chain, Entry, []), PrivateKey};
+        _ ->
+            {DefaultCert, DefaultChain, DefaultKey}
+    end.
+
+sni_cert_entry(ServerName, SniCerts) when is_map(SniCerts) ->
+    case normalize_sni_name(ServerName) of
+        undefined ->
+            undefined;
+        Normalized ->
+            case maps:get(Normalized, SniCerts, undefined) of
+                undefined -> wildcard_sni_cert_entry(Normalized, SniCerts);
+                Entry -> Entry
+            end
+    end;
+sni_cert_entry(_ServerName, _SniCerts) ->
+    undefined.
+
+wildcard_sni_cert_entry(ServerName, SniCerts) ->
+    Labels = binary:split(ServerName, <<".">>, [global]),
+    wildcard_sni_cert_entry_1(Labels, SniCerts).
+
+wildcard_sni_cert_entry_1([_Only], _SniCerts) ->
+    undefined;
+wildcard_sni_cert_entry_1([_Head | Tail], SniCerts) ->
+    Candidate = iolist_to_binary([<<"*">>, <<".">>, join_labels(Tail)]),
+    case maps:get(Candidate, SniCerts, undefined) of
+        undefined -> wildcard_sni_cert_entry_1(Tail, SniCerts);
+        Entry -> Entry
+    end.
+
+join_labels([]) ->
+    <<>>;
+join_labels([One]) ->
+    One;
+join_labels([H | T]) ->
+    <<H/binary, ".", (join_labels(T))/binary>>.
+
+normalize_sni_name(undefined) ->
+    undefined;
+normalize_sni_name(<<>>) ->
+    undefined;
+normalize_sni_name(Sni) when is_binary(Sni) ->
+    Lower = string:lowercase(Sni),
+    case {byte_size(Lower) > 0, binary:last(Lower)} of
+        {true, $.} -> normalize_sni_name(binary:part(Lower, 0, byte_size(Lower) - 1));
+        _ -> Lower
+    end;
+normalize_sni_name(Sni) when is_list(Sni) ->
+    normalize_sni_name(unicode:characters_to_binary(Sni, utf8));
+normalize_sni_name(_) ->
+    undefined.
 
 %%====================================================================
 %% Internal Functions - Stream Processing
